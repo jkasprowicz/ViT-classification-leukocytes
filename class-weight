@@ -1,0 +1,22 @@
+import pandas as pd
+
+# Load your CSV
+df = pd.read_csv('test_classes.csv')  # or 'train_classes.csv'
+
+# Count total samples per class
+class_counts = df['label'].value_counts().sort_index()
+
+print("Class distribution:")
+print(class_counts)
+
+# Optional: visualize
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(10, 6))
+class_counts.plot(kind='bar')
+plt.title("Samples per class")
+plt.xlabel("Class")
+plt.ylabel("Count")
+plt.xticks(rotation=45, ha='right')
+plt.tight_layout()
+plt.show()
