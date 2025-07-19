@@ -1,0 +1,332 @@
+#checking gpu's
+
+!nvidia-smi
+
+import os
+import json
+import pandas as pd
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import transforms
+import timm
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+# ----------------- Dataset -----------------
+class LeukocyteDataset(Dataset):
+    def __init__(self, csv_file, root_dir, transform=None):
+        self.annotations = pd.read_csv(csv_file)
+        self.root_dir = root_dir
+        self.transform = transform
+
+        self.label_names = sorted(self.annotations['label'].unique())
+        self.label_to_idx = {label: idx for idx, label in enumerate(self.label_names)}
+
+    def __len__(self):
+        return len(self.annotations)
+
+    def __getitem__(self, idx):
+        img_name = os.path.join(self.root_dir, self.annotations.iloc[idx, 0])
+        image = Image.open(img_name).convert('RGB')
+        label_name = self.annotations.iloc[idx, 1]
+        label = self.label_to_idx[label_name]
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label
+
+# ----------------- Hyperparameters -----------------
+BATCH_SIZE = 16
+NUM_EPOCHS = 50
+LR = 1e-6
+patience = 5  # Early stopping patience
+
+# ----------------- Data Loaders -----------------
+train_transform = transforms.Compose([
+    transforms.Resize((384, 384)),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5]*3, [0.5]*3)
+])
+
+val_transform = transforms.Compose([
+    transforms.Resize((384, 384)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5]*3, [0.5]*3)
+])
+
+train_dataset = LeukocyteDataset('/lapix/train/_classes.csv', 'train', transform=train_transform)
+val_dataset = LeukocyteDataset('/lapix/valid/_classes.csv', 'valid', transform=val_transform)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+
+# ----------------- Device -----------------
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# ----------------- Class Weights -----------------
+label_counts = train_dataset.annotations['label'].value_counts().sort_index()
+total_samples = len(train_dataset)
+class_weights = total_samples / (len(label_counts) * label_counts)
+class_weights = torch.tensor(class_weights.values, dtype=torch.float)
+print("Class weights:", class_weights)
+
+# ----------------- Model -----------------
+model = timm.create_model('vit_base_patch16_384', pretrained=True, num_classes=len(train_dataset.label_names))
+model.to(device)
+
+criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+optimizer = optim.Adam(model.parameters(), lr=LR)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.1)
+
+# ----------------- Save label names for testing later -----------------
+with open('label_names.json', 'w') as f:
+    json.dump(train_dataset.label_names, f)
+print("✅ Label names saved for future testing consistency.")
+
+# ----------------- Metrics Storage -----------------
+history = {
+    'epoch': [],
+    'train_loss': [],
+    'train_acc': [],
+    'val_loss': [],
+    'val_acc': []
+}
+
+# ----------------- Early Stopping -----------------
+best_val_loss = float('inf')
+epochs_no_improve = 0
+
+# ----------------- Training Loop -----------------
+for epoch in range(NUM_EPOCHS):
+    model.train()
+    train_loss = 0
+    correct = 0
+    total = 0
+
+    for images, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Train]"):
+        images, labels = images.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item() * images.size(0)
+        _, predicted = outputs.max(1)
+        correct += predicted.eq(labels).sum().item()
+        total += labels.size(0)
+
+    avg_train_loss = train_loss / total
+    train_acc = correct / total
+
+    # Validation
+    model.eval()
+    val_loss = 0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for images, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Val]"):
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+            val_loss += loss.item() * images.size(0)
+            _, predicted = outputs.max(1)
+            correct += predicted.eq(labels).sum().item()
+            total += labels.size(0)
+
+    avg_val_loss = val_loss / total
+    val_acc = correct / total
+
+    print(f"\n✅ Epoch [{epoch+1}/{NUM_EPOCHS}] "
+          f"Train Loss: {avg_train_loss:.4f} | Train Acc: {train_acc:.4f} | "
+          f"Val Loss: {avg_val_loss:.4f} | Val Acc: {val_acc:.4f}\n")
+
+    # Save metrics
+    history['epoch'].append(epoch + 1)
+    history['train_loss'].append(avg_train_loss)
+    history['train_acc'].append(train_acc)
+    history['val_loss'].append(avg_val_loss)
+    history['val_acc'].append(val_acc)
+
+    # Step scheduler
+    scheduler.step()
+
+    # Check for improvement
+    if avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
+        epochs_no_improve = 0
+        torch.save(model.state_dict(), "vit_best_model.pth")
+        print(f"✅ Validation loss improved, model saved as vit_best_model.pth")
+    else:
+        epochs_no_improve += 1
+        print(f"⚠️ No improvement for {epochs_no_improve}/{patience} epochs.")
+
+    # Early stopping condition
+    if epochs_no_improve >= patience:
+        print(f"⛔ Early stopping triggered at epoch {epoch+1}. Best Val Loss: {best_val_loss:.4f}")
+        break
+
+    # Save checkpoint for this epoch
+    torch.save(model.state_dict(), f"vit_epoch_{epoch+1}.pth")
+    torch.cuda.empty_cache()
+
+# ----------------- Save Metrics to CSV -----------------
+df_history = pd.DataFrame(history)
+df_history.to_csv('training_metrics.csv', index=False)
+print("✅ Training metrics saved to training_metrics.csv")
+
+# ----------------- Plot Loss and Accuracy Curves -----------------
+plt.figure(figsize=(12, 5))
+
+# Loss
+plt.subplot(1, 2, 1)
+plt.plot(history['epoch'], history['train_loss'], label='Train Loss')
+plt.plot(history['epoch'], history['val_loss'], label='Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Loss Over Epochs')
+plt.legend()
+
+# Accuracy
+plt.subplot(1, 2, 2)
+plt.plot(history['epoch'], history['train_acc'], label='Train Accuracy')
+plt.plot(history['epoch'], history['val_acc'], label='Validation Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.title('Accuracy Over Epochs')
+plt.legend()
+
+plt.tight_layout()
+plt.savefig('training_curves.png', dpi=300)
+plt.show()
+print("✅ Training curves saved to training_curves.png")
+
+print("🎯 Training pipeline completed successfully with early stopping.")
+
+import os
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+
+# ------------------------
+# 1. Setup
+# ------------------------
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+class_names = ['Artefato', 'Basofilo', 'Bastonete', 'Blasto', 'Eosinofilo', 'Eritroblasto',
+               'Linfocito', 'Linfocito atipico', 'Metamielocito', 'Mielocito',
+               'Monocito', 'Neutrofilo segmentado', 'Promielocito', 'Restos celulares']
+
+# ------------------------
+# 2. Dataset
+# ------------------------
+
+class TestDataset(Dataset):
+    def __init__(self, csv_file, image_folder, transform=None):
+        self.data = pd.read_csv(csv_file)
+        self.image_folder = image_folder
+        self.transform = transform
+        self.label_to_idx = {label: idx for idx, label in enumerate(class_names)}
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        img_name = self.data.iloc[idx]['filename']
+        label_name = self.data.iloc[idx]['label']
+        label = self.label_to_idx[label_name]
+        img_path = os.path.join(self.image_folder, img_name)
+        image = Image.open(img_path).convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+        return image, label, img_name
+
+transform = transforms.Compose([
+    transforms.Resize((384, 384)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5])
+])
+
+test_dataset = TestDataset('/lapix/test/_classes.csv', '/lapix/test/', transform)
+test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
+
+# ------------------------
+# 3. Load model
+# ------------------------
+
+import timm
+model = timm.create_model('vit_base_patch16_384', pretrained=False, num_classes=len(class_names))
+model.load_state_dict(torch.load('vit_best_model.pth', map_location=device))
+model.to(device)
+model.eval()
+
+print("✅ Model loaded and ready.")
+
+# ------------------------
+# 4. Inference and metrics
+# ------------------------
+
+all_preds = []
+all_labels = []
+all_filenames = []
+
+with torch.no_grad():
+    for images, labels, filenames in test_loader:
+        images = images.to(device)
+        outputs = model(images)
+        preds = torch.argmax(outputs, dim=1).cpu().numpy()
+        labels = labels.cpu().numpy()
+        
+        all_preds.extend(preds)
+        all_labels.extend(labels)
+        all_filenames.extend(filenames)
+
+# Metrics
+report = classification_report(all_labels, all_preds, target_names=class_names)
+print(report)
+
+# Confusion matrix
+cm = confusion_matrix(all_labels, all_preds)
+plt.figure(figsize=(12,10))
+sns.heatmap(cm, annot=True, fmt='d', xticklabels=class_names, yticklabels=class_names, cmap='Blues')
+plt.xlabel('Predicted')
+plt.ylabel('True')
+plt.title('Confusion Matrix')
+plt.show()
+
+# ------------------------
+# 5. Visualize predictions
+# ------------------------
+
+def visualize_predictions(num_images=8):
+    indices = np.random.choice(len(all_filenames), num_images, replace=False)
+    fig, axs = plt.subplots(2, num_images//2, figsize=(15, 6))
+
+    for ax, idx in zip(axs.flatten(), indices):
+        img_path = os.path.join('/lapix/test', all_filenames[idx])
+        image = Image.open(img_path).convert('RGB')
+        ax.imshow(image)
+        pred_label = class_names[all_preds[idx]]
+        true_label = class_names[all_labels[idx]]
+        ax.set_title(f"Pred: {pred_label}\nTrue: {true_label}", fontsize=9)
+        ax.axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+visualize_predictions(8)
+
