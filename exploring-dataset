@@ -1,0 +1,82 @@
+#exploring the dataset and also modifying the annotations files saved from roboflow
+
+import pandas as pd
+
+# Load your CSV
+df = pd.read_csv('/lapix/train/_classes.csv')  # or 'train_classes.csv'
+
+# Count total samples per class
+class_counts = df['label'].value_counts().sort_index()
+
+print("Class distribution:")
+print(class_counts)
+
+# Optional: visualize
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(10, 6))
+class_counts.plot(kind='bar')
+plt.title("Samples per class")
+plt.xlabel("Class")
+plt.ylabel("Count")
+plt.xticks(rotation=45, ha='right')
+plt.tight_layout()
+plt.show()
+
+import pandas as pd
+
+# Load your CSV
+df = pd.read_csv('/lapix/test/_classes.csv')  # or 'train_classes.csv'
+
+# Count total samples per class
+class_counts = df['label'].value_counts().sort_index()
+
+print("Class distribution:")
+print(class_counts)
+
+# Optional: visualize
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(10, 6))
+class_counts.plot(kind='bar')
+plt.title("Samples per class")
+plt.xlabel("Class")
+plt.ylabel("Count")
+plt.xticks(rotation=45, ha='right')
+plt.tight_layout()
+plt.show()
+
+import pandas as pd
+
+df = pd.read_csv('/lapix/train/_classes.csv')
+label_columns = df.columns[1:]  # skip filename
+
+# Get single label per image
+df['label'] = df[label_columns].idxmax(axis=1)
+df_single = df[['filename', 'label']]
+df_single.to_csv('classes_single_label.csv', index=False)
+
+import pandas as pd
+
+df = pd.read_csv('/lapix/valid/_classes.csv')
+label_columns = df.columns[1:]  # skip filename
+
+# Get single label per image
+df['label'] = df[label_columns].idxmax(axis=1)
+df_single = df[['filename', 'label']]
+df_single.to_csv('classes_single_label.csv', index=False)
+
+import pandas as pd
+
+df = pd.read_csv('/lapix/test/_classes.csv')
+label_columns = df.columns[1:]  # skip filename
+
+# Get single label per image
+df['label'] = df[label_columns].idxmax(axis=1)
+df_single = df[['filename', 'label']]
+df_single.to_csv('classes_single_label.csv', index=False)
+
+
+
+
+
