@@ -2,6 +2,12 @@
 
 !nvidia-smi
 
+import pandas as pd
+
+df = pd.read_csv('/lapix/train/_classes.csv')
+class_names = sorted(df['label'].unique().tolist())
+print(class_names)
+
 import os
 import json
 import pandas as pd
