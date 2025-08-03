@@ -1,0 +1,49 @@
+import os
+import shutil
+
+source_img_dir = 'yolo_augmented_dataset/images/train'
+source_lbl_dir = 'yolo_augmented_dataset/labels/train'
+target_dir = 'dataset/train'
+
+os.makedirs(target_dir, exist_ok=True)
+
+for fname in os.listdir(source_img_dir):
+    if not fname.lower().endswith(('.jpg', '.jpeg', '.png')):
+        continue
+
+    image_path = os.path.join(source_img_dir, fname)
+    label_path = os.path.join(source_lbl_dir, fname.rsplit('.', 1)[0] + '.txt')
+
+    if not os.path.exists(label_path):
+        continue
+
+    with open(label_path, 'r') as f:
+        lines = f.readlines()
+
+    # Skip empty label files
+    if not lines:
+        print(f"⚠️ Skipping {fname}: empty label file")
+        continue
+
+    # Skip malformed lines
+    first_valid_line = None
+    for line in lines:
+        parts = line.strip().split()
+        if len(parts) >= 1:
+            first_valid_line = parts
+            break
+
+    if not first_valid_line:
+        print(f"⚠️ Skipping {fname}: no valid annotation line")
+        continue
+
+    try:
+        class_id = int(first_valid_line[0])
+    except ValueError:
+        print(f"⚠️ Skipping {fname}: class ID is not a valid integer")
+        continue
+
+    class_dir = os.path.join(target_dir, str(class_id))
+    os.makedirs(class_dir, exist_ok=True)
+
+    shutil.copy(image_path, os.path.join(class_dir, fname))
