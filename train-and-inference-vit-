@@ -1,0 +1,364 @@
+!nvidia-smi
+
+!pip install torchmetrics
+import pandas as pd
+import os
+import json
+import pandas as pd
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import transforms
+import timm
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from torch.utils.data import WeightedRandomSampler
+
+# --- Imports de métricas adicionadas ---
+import torchmetrics
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+# ------------------------------------
+
+# Lê o arquivo CSV e obtém os nomes das classes
+df = pd.read_csv('/lapix/train/_classes.csv')
+class_names = sorted(df['label'].unique().tolist())
+print(f"Nomes das classes encontrados: {class_names}")
+
+# ----------------- Dataset -----------------
+class LeukocyteDataset(Dataset):
+    def __init__(self, csv_file, root_dir, transform=None):
+        self.annotations = pd.read_csv(csv_file)
+        self.root_dir = root_dir
+        self.transform = transform
+        self.label_names = sorted(self.annotations['label'].unique())
+        self.label_to_idx = {label: idx for idx, label in enumerate(self.label_names)}
+
+    def __len__(self):
+        return len(self.annotations)
+
+    def __getitem__(self, idx):
+        img_name = os.path.join(self.root_dir, self.annotations.iloc[idx, 0])
+        image = Image.open(img_name).convert('RGB')
+        label_name = self.annotations.iloc[idx, 1]
+        label = self.label_to_idx[label_name]
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label
+
+# ----------------- Hiperparâmetros -----------------
+BATCH_SIZE = 16
+NUM_EPOCHS = 50
+LR = 1e-5
+patience = 5  # Paciência para Early Stopping
+
+# ----------------- DataLoaders -----------------
+train_transform = transforms.Compose([
+    transforms.Resize((384, 384)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.5),
+    transforms.RandomRotation(degrees=45),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5]*3, [0.5]*3)
+])
+
+val_transform = transforms.Compose([
+    transforms.Resize((384, 384)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5]*3, [0.5]*3)
+])
+
+train_dataset = LeukocyteDataset('/lapix/train/_classes.csv', 'train', transform=train_transform)
+val_dataset = LeukocyteDataset('/lapix/valid/_classes.csv', 'valid', transform=val_transform)
+
+# ----------------- Amostragem Ponderada (Weighted Sampler) -----------------
+label_counts = train_dataset.annotations['label'].value_counts()
+class_weights = 1.0 / label_counts
+sample_weights = [class_weights[label] for label in train_dataset.annotations['label']]
+sample_weights_tensor = torch.DoubleTensor(sample_weights)
+sampler = WeightedRandomSampler(weights=sample_weights_tensor, num_samples=len(sample_weights_tensor), replacement=True)
+
+# Ao usar um sampler, shuffle deve ser False
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=sampler, num_workers=4)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+
+# ----------------- Dispositivo (Device) -----------------
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Usando dispositivo: {device}")
+
+# ----------------- Modelo -----------------
+model = timm.create_model('vit_base_patch16_384', pretrained=True, num_classes=len(train_dataset.label_names))
+model.to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=LR)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.1)
+
+# ----------------- Salvar Nomes dos Rótulos -----------------
+with open('label_names.json', 'w') as f:
+    json.dump(train_dataset.label_names, f)
+print("✅ Nomes dos rótulos salvos para consistência em testes futuros.")
+
+# ----------------- Armazenamento de Métricas -----------------
+# <-- Modificado: Adicionando novas métricas ao histórico
+history = {
+    'epoch': [],
+    'train_loss': [], 'train_acc': [],
+    'val_loss': [], 'val_acc': [],
+    'val_precision': [],
+    'val_recall': [],
+    'val_f1': []
+}
+
+# --- Inicialização do TorchMetrics --- # <-- Adicionado
+num_classes = len(train_dataset.label_names)
+val_precision_metric = torchmetrics.classification.Precision(task="multiclass", num_classes=num_classes, average='macro').to(device)
+val_recall_metric = torchmetrics.classification.Recall(task="multiclass", num_classes=num_classes, average='macro').to(device)
+val_f1_metric = torchmetrics.classification.F1Score(task="multiclass", num_classes=num_classes, average='macro').to(device)
+# ------------------------------------
+
+# ----------------- Early Stopping -----------------
+best_val_loss = float('inf')
+epochs_no_improve = 0
+all_preds_final = [] # Para armazenar previsões da melhor época
+all_labels_final = [] # Para armazenar rótulos da melhor época
+
+# ----------------- Loop de Treinamento -----------------
+for epoch in range(NUM_EPOCHS):
+    model.train()
+    train_loss, correct, total = 0, 0, 0
+
+    for images, labels in tqdm(train_loader, desc=f"Época {epoch+1}/{NUM_EPOCHS} [Treino]"):
+        images, labels = images.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item() * images.size(0)
+        _, predicted = outputs.max(1)
+        correct += predicted.eq(labels).sum().item()
+        total += labels.size(0)
+
+    avg_train_loss = train_loss / total
+    train_acc = correct / total
+
+    # --- Validação ---
+    model.eval()
+    val_loss, correct, total = 0, 0, 0
+    all_preds_epoch = []
+    all_labels_epoch = []
+
+    with torch.no_grad():
+        for images, labels in tqdm(val_loader, desc=f"Época {epoch+1}/{NUM_EPOCHS} [Val]"):
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+            val_loss += loss.item() * images.size(0)
+            _, predicted = outputs.max(1)
+            correct += predicted.eq(labels).sum().item()
+            total += labels.size(0)
+
+            # <-- Adicionado: Atualiza as métricas e armazena previsões
+            val_precision_metric.update(predicted, labels)
+            val_recall_metric.update(predicted, labels)
+            val_f1_metric.update(predicted, labels)
+            all_preds_epoch.extend(predicted.cpu().numpy())
+            all_labels_epoch.extend(labels.cpu().numpy())
+
+    avg_val_loss = val_loss / total
+    val_acc = correct / total
+
+    # <-- Adicionado: Calcula o valor final das métricas para a época
+    val_precision = val_precision_metric.compute()
+    val_recall = val_recall_metric.compute()
+    val_f1 = val_f1_metric.compute()
+
+    # <-- Adicionado: Reseta as métricas para a próxima época
+    val_precision_metric.reset()
+    val_recall_metric.reset()
+    val_f1_metric.reset()
+
+    # <-- Modificado: Print statement atualizado
+    print(f"\n✅ Época [{epoch+1}/{NUM_EPOCHS}] "
+          f"Treino Loss: {avg_train_loss:.4f} | Treino Acc: {train_acc:.4f}\n"
+          f"Val Loss: {avg_val_loss:.4f}   | Val Acc: {val_acc:.4f} | "
+          f"Val Precision: {val_precision:.4f} | Val Recall: {val_recall:.4f} | Val F1: {val_f1:.4f}\n")
+
+    # <-- Modificado: Salva as novas métricas
+    history['epoch'].append(epoch + 1)
+    history['train_loss'].append(avg_train_loss)
+    history['train_acc'].append(train_acc)
+    history['val_loss'].append(avg_val_loss)
+    history['val_acc'].append(val_acc)
+    history['val_precision'].append(val_precision.item())
+    history['val_recall'].append(val_recall.item())
+    history['val_f1'].append(val_f1.item())
+
+    scheduler.step()
+
+    if avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
+        epochs_no_improve = 0
+        torch.save(model.state_dict(), "vit_best_model.pth")
+        all_preds_final = all_preds_epoch # Salva as previsões da melhor época
+        all_labels_final = all_labels_epoch # Salva os rótulos da melhor época
+        print(f"✅ Loss de validação melhorou, modelo salvo como vit_best_model.pth")
+    else:
+        epochs_no_improve += 1
+        print(f"⚠️ Sem melhora por {epochs_no_improve}/{patience} épocas.")
+
+    if epochs_no_improve >= patience:
+        print(f"⛔ Early stopping ativado na época {epoch+1}. Melhor Val Loss: {best_val_loss:.4f}")
+        break
+
+    torch.save(model.state_dict(), f"vit_epoch_{epoch+1}.pth")
+    torch.cuda.empty_cache()
+
+# ----------------- Salvar Métricas em CSV -----------------
+df_history = pd.DataFrame(history)
+df_history.to_csv('training_metrics.csv', index=False)
+print("✅ Métricas de treinamento salvas em training_metrics.csv")
+
+# ----------------- Avaliação Final: Matriz de Confusão ----------------- # <-- Adicionado
+print("\n📊 Gerando matriz de confusão final...")
+cm = confusion_matrix(all_labels_final, all_preds_final)
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+fig, ax = plt.subplots(figsize=(10, 10))
+disp.plot(ax=ax, xticks_rotation='vertical', cmap='Blues')
+plt.title('Matriz de Confusão do Melhor Modelo no Conjunto de Validação')
+plt.tight_layout()
+plt.savefig('confusion_matrix.png', dpi=300)
+plt.show()
+print("✅ Matriz de confusão salva em confusion_matrix.png")
+
+# -----------------------------------------------------------------------
+
+# ----------------- Plotar Curvas de Métricas ----------------- # <-- Modificado
+plt.figure(figsize=(20, 6))
+
+# Loss
+plt.subplot(1, 3, 1)
+plt.plot(history['epoch'], history['train_loss'], label='Train Loss')
+plt.plot(history['epoch'], history['val_loss'], label='Validation Loss')
+plt.xlabel('Época'); plt.ylabel('Loss'); plt.title('Loss ao Longo das Épocas'); plt.legend(); plt.grid(True)
+
+# Acurácia
+plt.subplot(1, 3, 2)
+plt.plot(history['epoch'], history['train_acc'], label='Train Accuracy')
+plt.plot(history['epoch'], history['val_acc'], label='Validation Accuracy')
+plt.xlabel('Época'); plt.ylabel('Acurácia'); plt.title('Acurácia ao Longo das Épocas'); plt.legend(); plt.grid(True)
+
+# Precision, Recall, F1
+plt.subplot(1, 3, 3)
+plt.plot(history['epoch'], history['val_precision'], label='Validation Precision')
+plt.plot(history['epoch'], history['val_recall'], label='Validation Recall')
+plt.plot(history['epoch'], history['val_f1'], label='Validation F1-Score')
+plt.xlabel('Época'); plt.ylabel('Score'); plt.title('Precision, Recall & F1-Score'); plt.legend(); plt.grid(True)
+
+plt.tight_layout()
+plt.savefig('training_curves_all_metrics.png', dpi=300)
+plt.show()
+print("✅ Curvas de métricas salvas em training_curves_all_metrics.png")
+
+print("\n🎯 Pipeline de treinamento concluído com sucesso.")
+
+
+
+import torch
+import timm
+import json
+from PIL import Image
+from torchvision import transforms
+import matplotlib.pyplot as plt
+
+# --- 1. CONFIGURAÇÃO ---
+# Caminhos para os arquivos salvos e para a imagem que você quer testar
+MODEL_PATH = 'vit_best_model.pth'
+LABEL_MAP_PATH = 'label_names.json'
+IMAGE_PATH = '/lapix/test/901_1_045_jpg.rf.f5a34df2940cfdbcbdb860813c0de9db.jpg' # ⚠️ MUDE AQUI para a sua imagem
+
+# Verifique se a GPU está disponível
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Usando dispositivo: {device}")
+
+
+# --- 2. CARREGAR O MODELO E OS RÓTULOS ---
+# Carregar o mapeamento de rótulos (nomes das classes)
+with open(LABEL_MAP_PATH, 'r') as f:
+    class_names = json.load(f)
+num_classes = len(class_names)
+
+# Carregar a arquitetura do modelo ViT (deve ser a mesma do treino)
+# O `pretrained=False` é importante aqui, pois vamos carregar nossos próprios pesos
+model = timm.create_model('vit_base_patch16_384', pretrained=False, num_classes=num_classes)
+
+# Carregar os pesos do modelo treinado
+# O map_location garante que funcione mesmo se você treinou na GPU e agora está usando CPU
+model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+model.to(device)
+
+# Colocar o modelo em modo de avaliação
+model.eval()
+print("✅ Modelo e rótulos carregados com sucesso!")
+
+
+# --- 3. DEFINIR AS TRANSFORMAÇÕES DA IMAGEM ---
+# ❗️ Use exatamente as mesmas transformações do seu conjunto de VALIDAÇÃO
+val_transform = transforms.Compose([
+    transforms.Resize((384, 384)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5]*3, [0.5]*3)
+])
+
+
+# --- 4. FUNÇÃO DE PREVISÃO ---
+def predict_image(image_path):
+    """
+    Carrega uma imagem, a processa e retorna a previsão do modelo.
+    """
+    try:
+        image = Image.open(image_path).convert('RGB')
+    except FileNotFoundError:
+        print(f"Erro: O arquivo de imagem não foi encontrado em '{image_path}'")
+        return
+
+    # Aplica as transformações e adiciona uma dimensão de batch (o modelo espera um lote de imagens)
+    image_tensor = val_transform(image).unsqueeze(0).to(device)
+
+    # Faz a previsão sem calcular gradientes
+    with torch.no_grad():
+        outputs = model(image_tensor)
+        
+        # Aplica a função softmax para obter probabilidades
+        probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
+        
+        # Pega a classe com a maior probabilidade
+        confidence, predicted_idx = torch.max(probabilities, 0)
+        predicted_class = class_names[predicted_idx.item()]
+
+    return image, predicted_class, confidence.item()
+
+# --- 5. EXECUTAR A PREVISÃO E MOSTRAR O RESULTADO ---
+if __name__ == '__main__':
+    result = predict_image(IMAGE_PATH)
+
+    if result:
+        image, prediction, confidence = result
+        print(f"🔬 Previsão: '{prediction}'")
+        print(f"Confidence: {confidence:.2%}")
+
+        # Mostra a imagem com o resultado
+        plt.figure(figsize=(8, 8))
+        plt.imshow(image)
+        plt.title(f"Previsão: {prediction} ({confidence:.2%})", fontsize=16)
+        plt.axis('off')
+        plt.show()
+
+
