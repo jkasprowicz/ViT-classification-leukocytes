@@ -1,81 +1,193 @@
-from transformers import ViTForImageClassification, ViTImageProcessor, TrainingArguments, Trainer
-from datasets import load_dataset
+import pandas as pd
+import os
+import json
+from PIL import Image
 import torch
-from transformers import EarlyStoppingCallback
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+import timm
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import torchmetrics
 
-# Load dataset from image folder
-dataset = load_dataset("imagefolder", data_dir="dataset", split="train")
+# ----------------- Definir os caminhos do seu dataset -----------------
+BASE_DIR = '/lapix/datasetvit/'
+TRAIN_DIR = os.path.join(BASE_DIR, 'train')
+VALID_DIR = os.path.join(BASE_DIR, 'valid')
 
-# Split if you don't have a separate test set
-split_dataset = dataset.train_test_split(test_size=0.1)  # 10% for test
-train_ds = split_dataset["train"]
-test_ds = split_dataset["test"]
+TRAIN_CSV = os.path.join(TRAIN_DIR, '_classes.csv')
+VALID_CSV = os.path.join(VALID_DIR, '_classes.csv')
 
-# Load processor (feature extractor) and model
-processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
+#/lapix/HistAuGAN/augmented_vit/
 
-label_names = ['Artefato', 'Basofilo', 'Bastonete', 'Blasto', 'Eosinofilo', 'Eritroblasto',
-               'Linfocito', 'Linfocito atipico', 'Metamielocito', 'Mielocito', 'Monocito',
-               'Neutrofilo segmentado', 'Promielocito', 'Restos celulares']
+# --- Carregar os nomes das classes (corrigido para multi-rótulo) ---
+try:
+    df_info = pd.read_csv(TRAIN_CSV)
+    # Pega o nome de todas as colunas, exceto a primeira ('filename')
+    class_names = df_info.columns.tolist()[1:]
+    print(f"✅ Encontradas {len(class_names)} classes: {class_names}")
+except FileNotFoundError:
+    print(f"❌ Erro: Arquivo '{TRAIN_CSV}' não encontrado.")
+    exit()
 
-label2id = {name: i for i, name in enumerate(label_names)}
-id2label = {i: name for i, name in enumerate(label_names)}
+# ----------------- Classe do Dataset (CORRIGIDA para Multi-Rótulo) -----------------
+class LeukocyteDataset(Dataset):
+    def __init__(self, csv_file, root_dir, transform=None):
+        self.annotations = pd.read_csv(csv_file)
+        self.root_dir = root_dir
+        self.transform = transform
+        print(f"Dataset carregado de '{csv_file}'. Encontradas {len(self.annotations)} imagens.")
 
-model = ViTForImageClassification.from_pretrained(
-    "google/vit-base-patch16-224-in21k",
-    num_labels=len(label_names),
-    id2label=id2label,
-    label2id=label2id,
+    def __len__(self):
+        return len(self.annotations)
+
+    def __getitem__(self, idx):
+        img_name = os.path.join(self.root_dir, self.annotations.iloc[idx, 0])
+        image = Image.open(img_name).convert('RGB')
+
+        # Carrega a linha inteira de 0s e 1s como o rótulo
+        labels = self.annotations.iloc[idx, 1:].values.astype(float)
+        labels = torch.tensor(labels, dtype=torch.float32)
+
+        if self.transform:
+            image = self.transform(image)
+        return image, labels
+
+# ----------------- Hiperparâmetros -----------------
+BATCH_SIZE = 16
+NUM_EPOCHS = 50
+LR = 1e-5
+patience = 7 # Sua paciência original
+
+# ----------------- Transformações das Imagens -----------------
+# O modelo 'vit_small_patch16_384' também espera imagens 384x384
+train_transform = transforms.Compose([
+    transforms.Resize((384, 384)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.5),
+    transforms.RandomRotation(degrees=45),
+    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.2),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]) # Normas do ImageNet são melhores
+])
+
+val_transform = transforms.Compose([
+    transforms.Resize((384, 384)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+# ----------------- Datasets e DataLoaders -----------------
+train_dataset = LeukocyteDataset(csv_file=TRAIN_CSV, root_dir=TRAIN_DIR, transform=train_transform)
+val_dataset = LeukocyteDataset(csv_file=VALID_CSV, root_dir=VALID_DIR, transform=val_transform)
+
+# REMOVIDO: WeightedRandomSampler não é ideal para multi-rótulo. Usamos shuffle=True.
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+
+# ----------------- Dispositivo -----------------
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"🚀 Usando dispositivo: {device}")
+
+# ----------------- Modelo (ViT Small) -----------------
+model = timm.create_model(
+    'vit_base_patch16_384',  # <-- MUDANÇA AQUI para o modelo "small"
+    pretrained=True,
+    num_classes=len(class_names),
+    drop_rate=0.3  # Taxa de dropout para regularização
 )
+model.to(device)
 
-def transform(example):
-    inputs = processor(images=example["image"], return_tensors="pt")
-    # inputs["pixel_values"] shape is (1, C, H, W)
-    pixel_values = inputs["pixel_values"].squeeze(0)  # remove batch dim -> (C, H, W)
-    return {
-        "pixel_values": pixel_values,
-        "labels": example["label"]
-    }
+# MUDANÇA: Função de perda para multi-rótulo
+criterion = nn.BCEWithLogitsLoss()
 
+# MUDANÇA: Otimizador AdamW
+optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-2)
 
-train_ds = train_ds.with_transform(transform)
-test_ds = test_ds.with_transform(transform)
+# MUDANÇA: Usando um scheduler mais dinâmico
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.1, patience=3)
 
-# Define training arguments
-training_args = TrainingArguments(
-    output_dir="./vit-checkpoints",
-    per_device_train_batch_size=2,
-    per_device_eval_batch_size=2,
-    num_train_epochs=50,
-    eval_strategy="epoch",
-    save_strategy="epoch",
-    logging_dir="./logs",
-    remove_unused_columns=False,
-    logging_steps=10,
-    load_best_model_at_end=True,
-    metric_for_best_model="loss",  # or "accuracy"
-    greater_is_better=False,       # because we want to minimize the loss
-    report_to=[]
-)
+# ----------------- Métricas (CORRIGIDO para Multi-Rótulo) -----------------
+history = {'epoch': [], 'train_loss': [], 'val_loss': [], 'val_acc': [], 'val_precision': [], 'val_recall': [], 'val_f1': []}
+num_labels = len(class_names)
+# MUDANÇA: task="multilabel"
+val_accuracy = torchmetrics.classification.Accuracy(task="multilabel", num_labels=num_labels).to(device)
+val_precision = torchmetrics.classification.Precision(task="multilabel", num_labels=num_labels).to(device)
+val_recall = torchmetrics.classification.Recall(task="multilabel", num_labels=num_labels).to(device)
+val_f1 = torchmetrics.classification.F1Score(task="multilabel", num_labels=num_labels).to(device)
 
-# Define metrics
-import evaluate
-accuracy = evaluate.load("accuracy")
+# ----------------- Loop de Treinamento (CORRIGIDO para Multi-Rótulo) -----------------
+best_val_loss = float('inf')
+epochs_no_improve = 0
 
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    preds = logits.argmax(-1)
-    return accuracy.compute(predictions=preds, references=labels)
+for epoch in range(NUM_EPOCHS):
+    model.train()
+    total_train_loss = 0
+    for images, labels in tqdm(train_loader, desc=f"Época {epoch+1}/{NUM_EPOCHS} [Treino]"):
+        images, labels = images.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        total_train_loss += loss.item()
+    avg_train_loss = total_train_loss / len(train_loader)
 
-# Create Trainer
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_ds,
-    eval_dataset=test_ds,
-    tokenizer=processor,
-    compute_metrics=compute_metrics,
-)
+    model.eval()
+    total_val_loss = 0
+    val_accuracy.reset(); val_precision.reset(); val_recall.reset(); val_f1.reset()
+    with torch.no_grad():
+        for images, labels in tqdm(val_loader, desc=f"Época {epoch+1}/{NUM_EPOCHS} [Validação]"):
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            total_val_loss += loss.item()
 
-# Train!
-trainer.train()
+            # MUDANÇA: Usar sigmoid para obter predições em multi-rótulo
+            preds = torch.sigmoid(outputs)
+            val_accuracy.update(preds, labels.int())
+            val_precision.update(preds, labels.int())
+            val_recall.update(preds, labels.int())
+            val_f1.update(preds, labels.int())
+
+    avg_val_loss = total_val_loss / len(val_loader)
+    acc = val_accuracy.compute(); prec = val_precision.compute(); rec = val_recall.compute(); f1 = val_f1.compute()
+
+    print(f"\n✅ Época [{epoch+1}/{NUM_EPOCHS}] | Loss Treino: {avg_train_loss:.4f} | Loss Validação: {avg_val_loss:.4f}\n"
+          f"Acurácia: {acc:.4f} | Precisão: {prec:.4f} | Recall: {rec:.4f} | F1-Score: {f1:.4f}\n")
+
+    history['epoch'].append(epoch + 1); history['train_loss'].append(avg_train_loss); history['val_loss'].append(avg_val_loss)
+    history['val_acc'].append(acc.item()); history['val_precision'].append(prec.item()); history['val_recall'].append(rec.item())
+    history['val_f1'].append(f1.item())
+
+    # MUDANÇA: scheduler.step(avg_val_loss) para ReduceLROnPlateau
+    scheduler.step(avg_val_loss)
+
+    if avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
+        epochs_no_improve = 0
+        torch.save(model.state_dict(), "vit_base_multilabel_best.pth")
+        print(f"✅ Loss de validação melhorou, modelo salvo!")
+    else:
+        epochs_no_improve += 1
+        print(f"⚠️ Sem melhora na validação por {epochs_no_improve}/{patience} épocas.")
+
+    if epochs_no_improve >= patience:
+        print(f"⛔ Early stopping ativado na época {epoch+1}.")
+        break
+
+# ----------------- Plotagem (sem Matriz de Confusão, que não é ideal para multi-rótulo) -----------------
+df_history = pd.DataFrame(history)
+df_history.to_csv('training_metrics_small_vit.csv', index=False)
+print("\n✅ Métricas de treinamento salvas.")
+
+plt.figure(figsize=(20, 5))
+plt.subplot(1, 3, 1); plt.plot(history['epoch'], history['train_loss'], label='Loss Treino'); plt.plot(history['epoch'], history['val_loss'], label='Loss Validação'); plt.title('Curvas de Loss'); plt.xlabel('Época'); plt.legend(); plt.grid(True)
+plt.subplot(1, 3, 2); plt.plot(history['epoch'], history['val_acc'], label='Acurácia', color='green'); plt.title('Acurácia Validação'); plt.xlabel('Época'); plt.legend(); plt.grid(True)
+plt.subplot(1, 3, 3); plt.plot(history['epoch'], history['val_precision'], label='Precisão'); plt.plot(history['epoch'], history['val_recall'], label='Recall'); plt.plot(history['epoch'], history['val_f1'], label='F1-Score'); plt.title('Métricas Validação'); plt.xlabel('Época'); plt.legend(); plt.grid(True)
+plt.tight_layout()
+plt.savefig('training_curves_small_vit.png')
+print("✅ Gráficos salvos.")
+print("\n🎯 Pipeline de treinamento concluído.")
