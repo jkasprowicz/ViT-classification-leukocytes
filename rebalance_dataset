@@ -1,0 +1,93 @@
+import pandas as pd
+import os
+import shutil
+from sklearn.model_selection import train_test_split
+
+# --- 1. Defina os caminhos para as pastas do seu dataset ---
+BASE_DIR = '/lapix/datasetvit/'
+TRAIN_DIR = os.path.join(BASE_DIR, 'train')
+VALID_DIR = os.path.join(BASE_DIR, 'valid')
+TEST_DIR = os.path.join(BASE_DIR, 'test')
+
+# Caminhos para os arquivos CSV
+TRAIN_CSV = os.path.join(TRAIN_DIR, '_classes.csv')
+VALID_CSV = os.path.join(VALID_DIR, '_classes.csv')
+TEST_CSV = os.path.join(TEST_DIR, '_classes.csv')
+
+print("Iniciando o processo de balanceamento do dataset...")
+
+try:
+    # --- 2. Carregar e combinar todos os dados em um único DataFrame ---
+    df_train = pd.read_csv(TRAIN_CSV)
+    df_valid = pd.read_csv(VALID_CSV)
+    df_test = pd.read_csv(TEST_CSV)
+
+    # Combinar tudo em um único DataFrame
+    master_df = pd.concat([df_train, df_valid, df_test], ignore_index=True)
+    
+    # Remover duplicatas, caso existam
+    master_df.drop_duplicates(subset=['filename'], inplace=True)
+    
+    print(f"Total de amostras únicas encontradas: {len(master_df)}")
+
+    # --- 3. Dividir o DataFrame na proporção 80/10/10 ---
+    # Primeiro, separamos 80% para treino e 20% para o restante (validação + teste)
+    train_df, temp_df = train_test_split(master_df, test_size=0.2, random_state=42)
+
+    # Agora, dividimos os 20% restantes igualmente entre validação e teste (50% de 20% = 10% do total)
+    valid_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=42)
+
+    print("\nNovas proporções calculadas:")
+    print(f"Treino: {len(train_df)} amostras (~{len(train_df)/len(master_df)*100:.2f}%)")
+    print(f"Validação: {len(valid_df)} amostras (~{len(valid_df)/len(master_df)*100:.2f}%)")
+    print(f"Teste: {len(test_df)} amostras (~{len(test_df)/len(master_df)*100:.2f}%)")
+
+    # --- 4. Mover os arquivos para as pastas corretas ---
+    print("\nMovendo arquivos de imagem para os diretórios corretos...")
+
+    # Dicionário para mapear cada arquivo à sua pasta de origem
+    source_map = {row['filename']: TRAIN_DIR for _, row in df_train.iterrows()}
+    source_map.update({row['filename']: VALID_DIR for _, row in df_valid.iterrows()})
+    source_map.update({row['filename']: TEST_DIR for _, row in df_test.iterrows()})
+
+    # Função para mover os arquivos com segurança
+    def move_files(df, destination_folder):
+        moved_count = 0
+        for _, row in df.iterrows():
+            filename = row['filename']
+            source_folder = source_map.get(filename)
+            
+            if not source_folder:
+                print(f"  Aviso: Arquivo '{filename}' não encontrado em nenhum diretório de origem.")
+                continue
+
+            source_path = os.path.join(source_folder, filename)
+            destination_path = os.path.join(destination_folder, filename)
+
+            # Move o arquivo apenas se ele não estiver no lugar certo
+            if source_path != destination_path and os.path.exists(source_path):
+                shutil.move(source_path, destination_path)
+                moved_count += 1
+        print(f"  {moved_count} arquivos movidos para a pasta '{os.path.basename(destination_folder)}'.")
+
+    move_files(train_df, TRAIN_DIR)
+    move_files(valid_df, VALID_DIR)
+    move_files(test_df, TEST_DIR)
+
+    # --- 5. Salvar os novos arquivos _classes.csv ---
+    print("\nSalvando os novos arquivos _classes.csv...")
+    train_df.to_csv(TRAIN_CSV, index=False)
+    valid_df.to_csv(VALID_CSV, index=False)
+    test_df.to_csv(TEST_CSV, index=False)
+    print("✅ Novos arquivos CSV salvos com sucesso.")
+
+    print("\n🎉 Processo de balanceamento concluído!")
+
+except FileNotFoundError as e:
+    print(f"❌ Erro: Arquivo CSV não encontrado. Verifique se os caminhos estão corretos. Detalhe: {e}")
+except Exception as e:
+    print(f"❌ Ocorreu um erro inesperado: {e}")
+
+# --- 6. Verificação final (opcional, mas recomendado) ---
+print("\n--- Verificação Final da Distribuição ---")
+!python -c "import os; BASE_DIR='/lapix/datasetvit/'; folders={'Treino': os.path.join(BASE_DIR, 'train'), 'Validação': os.path.join(BASE_DIR, 'valid'), 'Teste': os.path.join(BASE_DIR, 'test')}; counts = {}; total_images = 0; for name, path in folders.items(): count = len(os.listdir(path)); counts[name] = count; total_images += count; print('Pasta           | Quantidade   | Porcentagem (%)'); print('----------------------------------------'); for name, count in counts.items(): percentage = (count/total_images)*100; print(f'{name:<15} | {count:<12} | {percentage:.2f}%'); print('----------------------------------------'); print(f'{'Total':<15} | {total_images:<12} | 100.00%')"
