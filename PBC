@@ -1,0 +1,213 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+import timm # PyTorch Image Models
+import os
+import sys
+
+# --- 1. CONFIGURAÇÕES ---
+MODEL_WEIGHTS_PATH = '/lapix/vit_base_multilabel_best.pth'
+
+PBC_DATASET_PATH = '/lapix/pbc_dataset/PBC_dataset_split/PBC_dataset_split/Val'
+IMAGE_SIZE = 384
+BATCH_SIZE = 32
+NUM_CLASSES_PRIVATE = 14
+
+# Use 'cuda' se disponível, senão 'cpu'
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Usando dispositivo: {DEVICE}")
+
+
+
+
+# --- 2. DEFINIÇÃO DAS CLASSES (MAPEAMENTO) ---
+
+# Suas 14 classes (a ordem DEVE ser a mesma do seu treinamento)
+# Suas 14 classes (a ordem DEVE ser a mesma do seu treinamento)
+PRIVATE_CLASS_NAMES = [
+    'Artefato', 'Basofilo', 'Bastonete', 'Blasto', 'Eosinofilo', 'Eritroblasto',
+    'Linfocito', 'Linfocito atipico', 'Metamielocito', 'Mielocito', 'Monocito',
+    'Neutrofilo segmentado', 'Promielocito', 'Restos celulares'
+]
+
+# !! CORREÇÃO: Esta lista agora bate EXATAMENTE com as suas 6 pastas !!
+PBC_CLASS_NAMES = [
+    'basophil', 'eosinophil', 'erythroblast', 
+    'lymphocyte', 'monocyte', 'neutrophil'
+]
+
+# !! CORREÇÃO: Mapa ajustado para as 6 classes do PBC !!
+MODEL_TO_PBC_MAP = {
+    # Mapeamentos diretos
+    'Basofilo': 'basophil',
+    'Eosinofilo': 'eosinophil',
+    'Eritroblasto': 'erythroblast',
+    'Linfocito': 'lymphocyte',
+    'Monocito': 'monocyte',
+    
+    # Mapeamentos agrupados
+    'Neutrofilo segmentado': 'neutrophil',
+    'Bastonete': 'neutrophil',
+    'Linfocito atipico': 'lymphocyte', # Assumindo que atípico conta como linfócito
+
+    # Classes que não existem nas 6 pastas do PBC = 'Outro'
+    'Artefato': 'Outro',
+    'Blasto': 'Outro',
+    'Metamielocito': 'Outro',
+    'Mielocito': 'Outro',
+    'Promielocito': 'Outro',
+    'Restos celulares': 'Outro'
+}
+
+# Mapas de índice para nome (para o modelo)
+model_idx_to_name = {i: name for i, name in enumerate(PRIVATE_CLASS_NAMES)}
+
+# --- 3. CARREGAMENTO DO MODELO (ViT) ---
+
+print(f"Carregando arquitetura ViT (vit_base_patch16_384) com {NUM_CLASSES_PRIVATE} classes...")
+# NOTA: 'vit_base_patch16_224' é um palpite comum. 
+# Se você usou outro (ex: vit_base_patch32_224), mude aqui.
+try:
+    model = timm.create_model(
+        'vit_base_patch16_384', 
+        pretrained=False,  # Não queremos pesos do ImageNet
+        num_classes=NUM_CLASSES_PRIVATE # Configura a cabeça para 14 classes
+    )
+    
+    # Carregar os pesos que você treinou
+    print(f"Carregando pesos de: {MODEL_WEIGHTS_PATH}")
+    model.load_state_dict(
+        torch.load(MODEL_WEIGHTS_PATH, map_location=DEVICE)
+    )
+    
+    model.to(DEVICE)
+    model.eval() # Modo de avaliação (desliga dropout, etc.)
+    print("Modelo carregado com sucesso.")
+
+except FileNotFoundError:
+    print(f"Erro: Arquivo de pesos não encontrado em {MODEL_WEIGHTS_PATH}")
+    sys.exit(1)
+except Exception as e:
+    print(f"Erro ao carregar o modelo: {e}")
+    print("Verifique se o nome do modelo 'vit_base_patch16_384' e o num_classes=14 estão corretos.")
+    sys.exit(1)
+
+# --- 4. CARREGAMENTO DO DATASET (LISC) ---
+
+# Transformações de imagem (devem ser as mesmas do seu treinamento!)
+# Usando estatísticas padrão do ImageNet se você não tiver as suas.
+data_transform = transforms.Compose([
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+try:
+    print(f"Carregando dataset LISC de: {PBC_DATASET_PATH}")
+    test_dataset = datasets.ImageFolder(
+        root=LISC_DATASET_PATH, 
+        transform=data_transform
+    )
+    
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=False, 
+        num_workers=2
+    )
+    
+    # Mapas de índice para nome (para o LISC)
+    lisc_idx_to_name = {i: name for i, name in enumerate(test_dataset.classes)}
+    
+    # Verificação de Sanidade
+    print(f"Classes encontradas no LISC: {test_dataset.classes}")
+    if set(test_dataset.classes) != set(PBC_CLASS_NAMES):
+        print("Atenção: Os nomes das pastas do LISC não batem 100% com LISC_CLASS_NAMES.")
+        print(f"Esperado: {PBC_CLASS_NAMES}")
+        print(f"Encontrado: {test_dataset.classes}")
+
+except FileNotFoundError:
+    print(f"Erro: Dataset LISC não encontrado em {LISC_DATASET_PATH}")
+    sys.exit(1)
+
+
+# --- 5. LOOP DE AVALIAÇÃO (INFERÊNCIA E MAPEAMENTO) ---
+
+print("Iniciando avaliação...")
+all_preds_mapped = [] # Predições traduzidas (ex: 'neutrophil')
+all_labels_text = []  # Rótulos verdadeiros (ex: 'neutrophil')
+
+with torch.no_grad(): # Desativa o cálculo de gradientes
+    for i, (images, labels) in enumerate(test_loader):
+        images = images.to(DEVICE)
+        
+        # 1. Obter saídas do modelo (logits)
+        outputs = model(images) # Shape: [BATCH_SIZE, 14]
+        
+        # 2. Obter o índice da classe com maior logit (de 0 a 13)
+        _, predicted_indices = torch.max(outputs, 1)
+        
+        # Mover para CPU para processamento
+        predicted_indices = predicted_indices.cpu().numpy()
+        labels = labels.cpu().numpy()
+
+        # 3. Mapear predições e rótulos para texto
+        for pred_idx, label_idx in zip(predicted_indices, labels):
+            
+            # Pega o nome da predição (ex: 'Neutrofilo segmentado')
+            pred_name = model_idx_to_name.get(pred_idx, 'Desconhecido')
+            
+            # Traduz para o nome do LISC (ex: 'neutrophil')
+            mapped_pred = MODEL_TO_PBC_MAP.get(pred_name, 'Outro')
+            
+            # Pega o nome do rótulo verdadeiro (ex: 'neutrophil')
+            true_name = lisc_idx_to_name.get(label_idx, 'Desconhecido')
+            
+            all_preds_mapped.append(mapped_pred)
+            all_labels_text.append(true_name)
+        
+        if (i + 1) % 10 == 0:
+            print(f"  Processado batch {i+1} de {len(test_loader)}")
+
+print("Avaliação concluída.")
+
+# --- 6. FILTRO E CÁLCULO DE MÉTRICAS ---
+
+# O dataset LISC (rótulos verdadeiros) só contém as 5 classes.
+# As predições (all_preds_mapped) podem conter 'Outro'.
+# O classification_report lida bem com isso.
+
+if not all_labels_text:
+    print("Nenhum dado foi processado. Verifique o caminho do dataset.")
+    sys.exit(1)
+
+print("\n--- Relatório de Classificação (Zero-Shot) ---")
+# 'labels=LISC_CLASS_NAMES' garante que o relatório mostre as 5 classes
+# na ordem correta, mesmo que alguma não tenha sido predita.
+report = classification_report(
+    all_labels_text, 
+    all_preds_mapped, 
+    labels=PBC_CLASS_NAMES, 
+    digits=4,
+    zero_division=0
+)
+print(report)
+
+
+print("\n--- Matriz de Confusão ---")
+print(f"(Linhas = Verdadeiro, Colunas = Predito)")
+cm = confusion_matrix(
+    all_labels_text, 
+    all_preds_mapped, 
+    labels=PBC_CLASS_NAMES
+)
+print(f"Classes: {PBC_CLASS_NAMES}")
+print(cm)
+
+print("\n--- Acurácia Geral (focada nas 5 classes) ---")
+# Filtramos manualmente para calcular a acurácia
+# Acurácia = (Acertos nas 5 classes) / (Total de amostras das 5 classes)
+accuracy = accuracy_score(all_labels_text, all_preds_mapped)
+print(f"Acurácia: {accuracy * 100:.2f}%")
